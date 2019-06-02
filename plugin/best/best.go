@@ -4,6 +4,7 @@ package best
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"github.com/sparrc/go-ping"
 	"math"
@@ -41,12 +42,21 @@ func (c Best) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (i
 	m := new(dns.Msg)
 	m.SetReply(r)
 	qname := state.QName()
-	ip, err := getIps(qname)
-	if err != nil {
-		return plugin.NextOrFailure(c.Name(), c.Next, ctx, w, r)
+	var bestIp net.IP
+	if ip, ok := bestIpMaps.Load(qname); ok {
+		bestIp = ip.(net.IP)
+		log.Debugf("hit best %s[%s]", qname, bestIp.String())
+	} else {
+		ip1, err := getIps(qname)
+		if err != nil {
+			return plugin.NextOrFailure(c.Name(), c.Next, ctx, w, r)
+		}
+		bestIp = ip1
+		bestIpMaps.Store(qname, ip1)
 	}
+
 	hdr := dns.RR_Header{Name: state.QName(), Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 0}
-	m.Answer = []dns.RR{&dns.A{Hdr: hdr, A: ip}}
+	m.Answer = []dns.RR{&dns.A{Hdr: hdr, A: bestIp}}
 
 	w.WriteMsg(m)
 	return 0, nil
@@ -57,20 +67,29 @@ func (c Best) Name() string { return "best" }
 
 var locker sync.RWMutex
 var globalIpMaps sync.Map
+var bestIpMaps sync.Map
 
 type IpCache struct {
 	IP       string
+	Host     string
 	Status   *ping.Statistics
 	Fail     uint8
 	LastFail time.Time
 }
 
-func getIps(host string) (net.IP, error) {
+func getIps(host string) (bestIP net.IP, err error) {
+	defer func() {
+		if err1 := recover(); err1 != nil {
+			log.Debug(err1)
+			err = errors.New("can't get")
+		}
+	}()
 	pingUrl := "https://tools.ipip.net/ping.php?v=4&a=send&host=" + host + "&area%5B%5D=china&area%5B%5D=hmt&area%5B%5D=asia&area%5B%5D=europe&area%5B%5D=africa&area%5B%5D=na&area%5B%5D=sa&area%5B%5D=da"
 	cookie := "LOVEAPP_SESSID=52a68b6f73c7ef789c2dffccc6254a0ffc3fcb14; __jsluid=077d1353716aac038055cea37447aac5; _ga=GA1.2.87212559.1559490717; _gid=GA1.2.1712109698.1559490717; Hm_lvt_123ba42b8d6d2f680c91cb43c1e2be64=1559490717,1559490834; Hm_lpvt_123ba42b8d6d2f680c91cb43c1e2be64=1559490834"
 	req, _ := http.NewRequest("GET", pingUrl, nil)
 	req.Header.Add("Cookie", cookie)
 	req.Header.Add("Referer", "https://tools.ipip.net/ping.php")
+	req.Header.Add("Host", "tools.ipip.net")
 	client := &http.Client{
 
 	}
@@ -80,6 +99,7 @@ func getIps(host string) (net.IP, error) {
 	ipReg, _ := regexp.Compile(`(\d+\.\d+\.\d+\.\d+)`)
 	ipMap := make(map[string]bool)
 	//ipPingedNum := 0
+	waitFullBody := false
 	go func() {
 		for {
 			script, isPrefix, err1 := breader.ReadLine()
@@ -95,7 +115,7 @@ func getIps(host string) (net.IP, error) {
 
 								}
 							}()
-							ipCh <- getPing(ip2)
+							ipCh <- getPing(host, ip2)
 						}()
 					}
 				}
@@ -124,18 +144,20 @@ func getIps(host string) (net.IP, error) {
 			//case <-t.C:
 			//	break
 		}
-		if len(statList) >= len(ipMap) || len(statList) >= 5 {
+		if len(statList) >= len(ipMap) || (!waitFullBody && len(statList) >= 50) {
 			break
 		}
 	}
 	close(ipCh)
 	t.Stop()
-
+	resp.Body.Close()
 	sort.SliceStable(statList, func(i, j int) bool {
 		return statList[i].AvgRtt < statList[j].AvgRtt
 	})
 	//fmt.Print(statList)
-	return statList[0].IPAddr.IP, nil
+	bestIP = statList[0].IPAddr.IP
+	log.Debugf("get best %s[%s]", host, bestIP.String())
+	return bestIP, nil
 }
 
 func test() {
@@ -544,7 +566,7 @@ func test() {
 			ipMap[ip] = true
 			cnum += 1
 			go func() {
-				stats := getPing(ip2)
+				stats := getPing("", ip2)
 				locker.Lock()
 				statList = append(statList, stats)
 				locker.Unlock()
@@ -568,24 +590,46 @@ func test() {
 	fmt.Print(statList)
 }
 
-func getPing(ip string) (*ping.Statistics) {
+const pingTimeout = 10 * time.Second
+const failedInter = 3 * time.Minute
+
+func getPing(host, ip string) (*ping.Statistics) {
 	// chech cache
 	var ipCache IpCache
 	ipCache.IP = ip
 	if v, ok := globalIpMaps.LoadOrStore(ip, ipCache); ok {
 		ipCache = v.(IpCache)
 		// TODO 更好的命中
-		if ipCache.Status != nil && ipCache.Status.MinRtt > 0 {
+		if ipCache.Status == nil {
+			// 等待其他协程完成
+			log.Debugf("waiting %s[%s]\n", host, ip)
+			<-time.After(pingTimeout + time.Second)
+			if v2, ok2 := globalIpMaps.Load(ip); ok2 {
+				if v2.(IpCache).Status != nil {
+					log.Debugf("hit1 %s[%s]\n", host, ip)
+					return ipCache.Status
+				}
+			}
+			// 结果无效，重新生成
+			//globalIpMaps.Delete(ip)
+			//return getPing(host, ip)
+		} else if ipCache.Status.MinRtt > 0 {
+			log.Debugf("hit2 %s[%s]\n", host, ip)
+			return ipCache.Status
+		} else if ipCache.LastFail.Add(failedInter).Before(time.Now()) {
+			// 需要刷新
+		} else {
 			return ipCache.Status
 		}
 	}
-	fmt.Printf("ping %s\n", ip)
+
+	log.Debugf("ping %s[%s]\n", host, ip)
 	pinger, err := ping.NewPinger(ip)
 	if err != nil {
 		panic(err)
 	}
 	pinger.Debug = true
-	pinger.Timeout = 10 * time.Second
+	pinger.Timeout = pingTimeout
 	pinger.Count = 10
 	pinger.Run()                 // blocks until finished
 	stats := pinger.Statistics() // get send/receive/rtt stats
