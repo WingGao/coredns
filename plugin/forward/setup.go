@@ -135,6 +135,8 @@ func ParseForwardStanza(c *caddyfile.Dispenser) (*Forward, error) {
 
 func parseBlock(c *caddyfile.Dispenser, f *Forward) error {
 	switch c.Val() {
+	case "best":
+		f.best = true
 	case "except":
 		ignore := c.RemainingArgs()
 		if len(ignore) == 0 {
@@ -228,4 +230,4 @@ func parseBlock(c *caddyfile.Dispenser, f *Forward) error {
 	return nil
 }
 
-const max = 15 // Maximum number of upstreams.
+const max = 50 // Maximum number of upstreams.

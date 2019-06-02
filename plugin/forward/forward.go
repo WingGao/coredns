@@ -30,6 +30,7 @@ type Forward struct {
 
 	from    string
 	ignored []string
+	best    bool
 
 	tlsConfig     *tls.Config
 	tlsServerName string
@@ -61,7 +62,9 @@ func (f *Forward) Name() string { return "forward" }
 
 // ServeDNS implements plugin.Handler.
 func (f *Forward) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
-
+	if f.best {
+		return f.findBest(ctx, w, r)
+	}
 	state := request.Request{W: w, Req: r}
 	if !f.match(state) {
 		return plugin.NextOrFailure(f.Name(), f.Next, ctx, w, r)
