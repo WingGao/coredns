@@ -49,4 +49,5 @@ var Directives = []string{
 	"erratic",
 	"whoami",
 	"on",
+	"best",
 }

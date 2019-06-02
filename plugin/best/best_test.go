@@ -5,7 +5,8 @@ import (
 )
 
 func TestBest(t *testing.T) {
-	test()
+	//test()
+	getIps("google.com")
 }
 
 const version = "CoreDNS-001"

@@ -7,9 +7,9 @@ import (
 	"fmt"
 	"github.com/sparrc/go-ping"
 	"math"
-	"math/rand"
+	"net"
 	"net/http"
-	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -41,46 +41,13 @@ func (c Best) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (i
 	m := new(dns.Msg)
 	m.SetReply(r)
 	qname := state.QName()
-	pingUrl := "https://tools.ipip.net/ping.php?v=4&a=send&host=" + qname + "&area%5B%5D=china&area%5B%5D=hmt&area%5B%5D=asia&area%5B%5D=europe&area%5B%5D=africa&area%5B%5D=na&area%5B%5D=sa&area%5B%5D=da"
-	cookie := "LOVEAPP_SESSID=52a68b6f73c7ef789c2dffccc6254a0ffc3fcb14; __jsluid=077d1353716aac038055cea37447aac5; _ga=GA1.2.87212559.1559490717; _gid=GA1.2.1712109698.1559490717; Hm_lvt_123ba42b8d6d2f680c91cb43c1e2be64=1559490717,1559490834; Hm_lpvt_123ba42b8d6d2f680c91cb43c1e2be64=1559490834"
-	req, _ := http.NewRequest("GET", pingUrl, nil)
-	req.Header.Add("Cookie", cookie)
-	client := &http.Client{
-
-	}
-	resp, _ := client.Do(req)
-	breader := bufio.NewReader(resp.Body)
-	for {
-		script, isPrefix, err1 := breader.ReadLine()
-		if len(script) > 0 {
-
-		}
-		if isPrefix {
-
-		}
-		if err1 != nil {
-
-		}
+	ip, err := getIps(qname)
+	if err != nil {
+		return plugin.NextOrFailure(c.Name(), c.Next, ctx, w, r)
 	}
 	hdr := dns.RR_Header{Name: state.QName(), Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 0}
-	switch state.Name() {
-	default:
-		return plugin.NextOrFailure(c.Name(), c.Next, ctx, w, r)
-	case "authors.bind.":
-		rnd := rand.New(rand.NewSource(time.Now().Unix()))
+	m.Answer = []dns.RR{&dns.A{Hdr: hdr, A: ip}}
 
-		for _, i := range rnd.Perm(len(c.Authors)) {
-			m.Answer = append(m.Answer, &dns.TXT{Hdr: hdr, Txt: []string{c.Authors[i]}})
-		}
-	case "version.bind.", "version.server.":
-		m.Answer = []dns.RR{&dns.TXT{Hdr: hdr, Txt: []string{c.Version}}}
-	case "hostname.bind.", "id.server.":
-		hostname, err := os.Hostname()
-		if err != nil {
-			hostname = "localhost"
-		}
-		m.Answer = []dns.RR{&dns.TXT{Hdr: hdr, Txt: []string{trim(hostname)}}}
-	}
 	w.WriteMsg(m)
 	return 0, nil
 }
@@ -89,6 +56,87 @@ func (c Best) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (i
 func (c Best) Name() string { return "best" }
 
 var locker sync.RWMutex
+var globalIpMaps sync.Map
+
+type IpCache struct {
+	IP       string
+	Status   *ping.Statistics
+	Fail     uint8
+	LastFail time.Time
+}
+
+func getIps(host string) (net.IP, error) {
+	pingUrl := "https://tools.ipip.net/ping.php?v=4&a=send&host=" + host + "&area%5B%5D=china&area%5B%5D=hmt&area%5B%5D=asia&area%5B%5D=europe&area%5B%5D=africa&area%5B%5D=na&area%5B%5D=sa&area%5B%5D=da"
+	cookie := "LOVEAPP_SESSID=52a68b6f73c7ef789c2dffccc6254a0ffc3fcb14; __jsluid=077d1353716aac038055cea37447aac5; _ga=GA1.2.87212559.1559490717; _gid=GA1.2.1712109698.1559490717; Hm_lvt_123ba42b8d6d2f680c91cb43c1e2be64=1559490717,1559490834; Hm_lpvt_123ba42b8d6d2f680c91cb43c1e2be64=1559490834"
+	req, _ := http.NewRequest("GET", pingUrl, nil)
+	req.Header.Add("Cookie", cookie)
+	req.Header.Add("Referer", "https://tools.ipip.net/ping.php")
+	client := &http.Client{
+
+	}
+	resp, _ := client.Do(req)
+	breader := bufio.NewReader(resp.Body)
+	ipCh := make(chan *ping.Statistics, 1)
+	ipReg, _ := regexp.Compile(`(\d+\.\d+\.\d+\.\d+)`)
+	ipMap := make(map[string]bool)
+	//ipPingedNum := 0
+	go func() {
+		for {
+			script, isPrefix, err1 := breader.ReadLine()
+			if len(script) > 0 {
+				ips := ipReg.FindAllString(string(script), -1)
+				for _, ip := range ips {
+					if _, ok := ipMap[ip]; !ok {
+						ipMap[ip] = true
+						ip2 := ip
+						go func() {
+							defer func() {
+								if recover() != nil {
+
+								}
+							}()
+							ipCh <- getPing(ip2)
+						}()
+					}
+				}
+			}
+			if isPrefix {
+
+			}
+			if err1 != nil {
+				break
+			}
+		}
+	}()
+	var statList []*ping.Statistics
+	t := time.NewTimer(30 * time.Second)
+	for {
+		select {
+		case ip, ok := <-ipCh:
+			if !ok {
+				break
+			}
+			statList = append(statList, ip)
+			// 全部解析
+			if len(statList) == len(ipMap) {
+				break
+			}
+			//case <-t.C:
+			//	break
+		}
+		if len(statList) >= len(ipMap) || len(statList) >= 5 {
+			break
+		}
+	}
+	close(ipCh)
+	t.Stop()
+
+	sort.SliceStable(statList, func(i, j int) bool {
+		return statList[i].AvgRtt < statList[j].AvgRtt
+	})
+	//fmt.Print(statList)
+	return statList[0].IPAddr.IP, nil
+}
 
 func test() {
 	ipstrs := `216.58.196.238,
@@ -504,13 +552,16 @@ func test() {
 			}()
 		}
 	}
+
 	select {
 	case <-cc:
 		cnum -= 1
 		if cnum == 0 {
 			break
 		}
+
 	}
+
 	sort.SliceStable(statList, func(i, j int) bool {
 		return statList[i].AvgRtt < statList[j].AvgRtt
 	})
@@ -518,6 +569,16 @@ func test() {
 }
 
 func getPing(ip string) (*ping.Statistics) {
+	// chech cache
+	var ipCache IpCache
+	ipCache.IP = ip
+	if v, ok := globalIpMaps.LoadOrStore(ip, ipCache); ok {
+		ipCache = v.(IpCache)
+		// TODO 更好的命中
+		if ipCache.Status != nil && ipCache.Status.MinRtt > 0 {
+			return ipCache.Status
+		}
+	}
 	fmt.Printf("ping %s\n", ip)
 	pinger, err := ping.NewPinger(ip)
 	if err != nil {
@@ -530,6 +591,11 @@ func getPing(ip string) (*ping.Statistics) {
 	stats := pinger.Statistics() // get send/receive/rtt stats
 	if stats.AvgRtt == 0 {
 		stats.AvgRtt = math.MaxInt64
+		ipCache.Fail += 1
+		ipCache.LastFail = time.Now()
 	}
+	ipCache.IP = ip
+	ipCache.Status = stats
+	globalIpMaps.Store(ip, ipCache)
 	return stats
 }
