@@ -31,7 +31,23 @@ type Best struct {
 	Authors []string
 }
 
+type IpCache struct {
+	IP       string
+	Host     string
+	Status   *ping.Statistics
+	Fail     uint8
+	LastFail time.Time
+}
+
 var log = clog.NewWithPlugin("best")
+
+const pingTimeout = 10 * time.Second
+const failedInter = 3 * time.Minute
+
+var locker sync.RWMutex
+var cacheIpMaps sync.Map
+var bestHostIpMaps sync.Map
+
 // ServeDNS implements the plugin.Handler interface.
 func (c Best) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
 	state := request.Request{W: w, Req: r}
@@ -43,16 +59,25 @@ func (c Best) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (i
 	m.SetReply(r)
 	qname := state.QName()
 	var bestIp net.IP
-	if ip, ok := bestIpMaps.Load(qname); ok {
+	if ip, ok := bestHostIpMaps.Load(qname); ok {
+		if ip == nil { // 等待任务
+			time.Sleep(pingTimeout)
+			ip, _ = bestHostIpMaps.Load(qname)
+			if ip == nil {
+				return plugin.NextOrFailure(c.Name(), c.Next, ctx, w, r)
+			}
+		}
 		bestIp = ip.(net.IP)
 		log.Debugf("hit best %s[%s]", qname, bestIp.String())
 	} else {
+		// 标记任务进行中
+		bestHostIpMaps.Store(ip, nil)
 		ip1, err := getIps(qname)
 		if err != nil {
 			return plugin.NextOrFailure(c.Name(), c.Next, ctx, w, r)
 		}
 		bestIp = ip1
-		bestIpMaps.Store(qname, ip1)
+		bestHostIpMaps.Store(qname, ip1)
 	}
 
 	hdr := dns.RR_Header{Name: state.QName(), Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 0}
@@ -64,18 +89,6 @@ func (c Best) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (i
 
 // Name implements the Handler interface.
 func (c Best) Name() string { return "best" }
-
-var locker sync.RWMutex
-var globalIpMaps sync.Map
-var bestIpMaps sync.Map
-
-type IpCache struct {
-	IP       string
-	Host     string
-	Status   *ping.Statistics
-	Fail     uint8
-	LastFail time.Time
-}
 
 func getIps(host string) (bestIP net.IP, err error) {
 	defer func() {
@@ -590,28 +603,25 @@ func test() {
 	fmt.Print(statList)
 }
 
-const pingTimeout = 10 * time.Second
-const failedInter = 3 * time.Minute
-
 func getPing(host, ip string) (*ping.Statistics) {
 	// chech cache
 	var ipCache IpCache
 	ipCache.IP = ip
-	if v, ok := globalIpMaps.LoadOrStore(ip, ipCache); ok {
+	if v, ok := cacheIpMaps.LoadOrStore(ip, ipCache); ok {
 		ipCache = v.(IpCache)
 		// TODO 更好的命中
 		if ipCache.Status == nil {
 			// 等待其他协程完成
 			log.Debugf("waiting %s[%s]\n", host, ip)
 			<-time.After(pingTimeout + time.Second)
-			if v2, ok2 := globalIpMaps.Load(ip); ok2 {
+			if v2, ok2 := cacheIpMaps.Load(ip); ok2 {
 				if v2.(IpCache).Status != nil {
 					log.Debugf("hit1 %s[%s]\n", host, ip)
 					return ipCache.Status
 				}
 			}
 			// 结果无效，重新生成
-			//globalIpMaps.Delete(ip)
+			//cacheIpMaps.Delete(ip)
 			//return getPing(host, ip)
 		} else if ipCache.Status.MinRtt > 0 {
 			log.Debugf("hit2 %s[%s]\n", host, ip)
@@ -640,6 +650,6 @@ func getPing(host, ip string) (*ping.Statistics) {
 	}
 	ipCache.IP = ip
 	ipCache.Status = stats
-	globalIpMaps.Store(ip, ipCache)
+	cacheIpMaps.Store(ip, ipCache)
 	return stats
 }
