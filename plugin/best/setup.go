@@ -3,6 +3,7 @@
 package best
 
 import (
+	"net"
 	"sort"
 
 	"github.com/coredns/coredns/core/dnsserver"
@@ -29,6 +30,20 @@ func setup(c *caddy.Controller) error {
 		return Best{Next: next, Version: version, Authors: authors}
 	})
 
+	if len(privateIPBlocks) == 0 {
+		for _, cidr := range []string{
+			"127.0.0.0/8",    // IPv4 loopback
+			"10.0.0.0/8",     // RFC1918
+			"172.16.0.0/12",  // RFC1918
+			"192.168.0.0/16", // RFC1918
+			"::1/128",        // IPv6 loopback
+			"fe80::/10",      // IPv6 link-local
+			"fc00::/7",       // IPv6 unique local addr
+		} {
+			_, block, _ := net.ParseCIDR(cidr)
+			privateIPBlocks = append(privateIPBlocks, block)
+		}
+	}
 	return nil
 }
 
@@ -71,3 +86,14 @@ func trim(s string) string {
 }
 
 var chaosVersion string
+var privateIPBlocks []*net.IPNet
+
+
+func isPrivateIP(ip net.IP) bool {
+	for _, block := range privateIPBlocks {
+		if block.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}

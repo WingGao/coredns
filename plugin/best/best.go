@@ -119,16 +119,20 @@ func getIps(host string) (bestIP net.IP, err error) {
 			if len(script) > 0 {
 				ips := ipReg.FindAllString(string(script), -1)
 				for _, ip := range ips {
+					ip4 := net.ParseIP(ip)
+					// skip private ip
+					if isPrivateIP(ip4) {
+						continue
+					}
 					if _, ok := ipMap[ip]; !ok {
 						ipMap[ip] = true
-						ip2 := ip
 						go func() {
 							defer func() {
 								if recover() != nil {
 
 								}
 							}()
-							ipCh <- getPing(host, ip2)
+							ipCh <- getPing(host, ip4.String())
 						}()
 					}
 				}
